@@ -14,7 +14,7 @@ from googleapiclient.discovery import build
 import logging
 from typing import Optional, Iterator, Any, Dict
 from google.auth.transport.requests import Request as GoogleAuthRequest
-
+from email.utils import parsedate_to_datetime
 
 logger = logging.getLogger(__name__)
 load_dotenv(".env")
@@ -130,12 +130,6 @@ async def fetch_primary_inbox_emails_threaded(
     max_messages_per_thread: int = 10,
     include_read: bool = True
 ):
-    """
-    Fetch emails from the Primary Inbox, grouped by conversation (threadId).
-    MIME-decoded body text and HTML included.
-    Returns: list of threads, each containing message list (sorted by Date).
-    """
-
     if user_id not in TOKEN_STORE:
         raise HTTPException(status_code=404, detail="No tokens found for this user_id")
 
@@ -155,12 +149,23 @@ async def fetch_primary_inbox_emails_threaded(
         TOKEN_STORE[user_id]["expiry"] = creds.expiry.isoformat() if creds.expiry else None
 
     service = build("gmail", "v1", credentials=creds)
+    profile_info = service.users().getProfile(userId="me").execute()
+    gmail_id = profile_info.get("emailAddress")
+
+    try:
+        oauth_service = build("oauth2", "v2", credentials=creds)
+        user_info = oauth_service.userinfo().get().execute()
+        user_name = user_info.get("given_name", "")
+        profile_photo = user_info.get("picture", "")
+    except Exception as e:
+        print(f"Error getting profile photo: {e}")
+        user_name = ""
+        profile_photo = ""
 
     q = "in:inbox category:primary"
     if not include_read:
         q += " is:unread"
 
-    # Fetch threads instead of messages
     threads_resp = service.users().threads().list(
         userId="me",
         q=q,
@@ -171,14 +176,12 @@ async def fetch_primary_inbox_emails_threaded(
     all_threads = []
 
     def decode_part(part):
-        """Decode base64 Gmail message body."""
         body_data = part.get("body", {}).get("data")
         if not body_data:
             return ""
         return base64.urlsafe_b64decode(body_data.encode("utf-8")).decode("utf-8", errors="ignore")
 
     def extract_mime_parts(payload):
-        """Recursively extract plain text and HTML from MIME payload."""
         body_text, body_html = "", ""
         mime_type = payload.get("mimeType", "")
         if "multipart" in mime_type:
@@ -207,21 +210,38 @@ async def fetch_primary_inbox_emails_threaded(
 
             body_text, body_html = extract_mime_parts(payload)
 
+            label_ids = msg.get("labelIds", [])
+            is_unread = "UNREAD" in label_ids
+
+            raw_date = h("Date")
+            try:
+                parsed_date = parsedate_to_datetime(raw_date)
+                now = datetime.now(parsed_date.tzinfo)
+                if parsed_date.date() == now.date():
+                    sent_time = parsed_date.strftime("Today, %I:%M %p")
+                elif parsed_date.date() == (now - timedelta(days=1)).date():
+                    sent_time = parsed_date.strftime("Yesterday, %I:%M %p")
+                else:
+                    sent_time = parsed_date.strftime("%d %b, %I:%M %p")
+            except Exception:
+                sent_time = raw_date or "Unknown"
+
             msg_obj = {
                 "id": msg.get("id"),
                 "snippet": msg.get("snippet"),
                 "from": h("From"),
                 "to": h("To"),
                 "subject": h("Subject"),
-                "date": h("Date"),
+                "date": raw_date,
+                "sent_time": sent_time,       
+                "is_unread": is_unread,        
                 "body_text": body_text.strip(),
                 "body_html": body_html.strip(),
             }
             thread_msgs.append(msg_obj)
 
-        # Sort messages by date ascending for coherent thread flow
+        # Sort messages by date ascending
         def parse_date_safe(d):
-            from email.utils import parsedate_to_datetime
             try:
                 return parsedate_to_datetime(d)
             except Exception:
@@ -233,12 +253,17 @@ async def fetch_primary_inbox_emails_threaded(
             "threadId": thread_id,
             "message_count": len(thread_msgs),
             "subject": thread_msgs[0]["subject"] if thread_msgs else None,
-            "participants": list(
-                {m["from"] for m in thread_msgs if m.get("from")}
-            ),
+            "participants": list({m["from"] for m in thread_msgs if m.get("from")}),
             "messages": thread_msgs
         })
-    print(f"Fetched {len(all_threads)} threads for user {user_id}")
-    print("Sample thread data:", all_threads[0] if all_threads else "No threads found")
 
-    return JSONResponse(content={"thread_count": len(all_threads), "threads": all_threads})
+    return JSONResponse(content={
+        "thread_count": len(all_threads), 
+        "threads": all_threads,
+        "user_info": {
+        "gmail_id": gmail_id,
+        "profile_photo": profile_photo,
+        "user_name": user_name
+    }})
+
+
