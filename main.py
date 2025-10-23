@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, Body
 from fastapi.responses import RedirectResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import requests
@@ -7,7 +7,7 @@ from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
 import os
 from dotenv import load_dotenv
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from google.oauth2.credentials import Credentials
 import base64
 from googleapiclient.discovery import build
@@ -15,6 +15,8 @@ import logging
 from typing import Optional, Iterator, Any, Dict
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from email.utils import parsedate_to_datetime
+from pydantic import BaseModel
+
 
 logger = logging.getLogger(__name__)
 load_dotenv(".env")
@@ -56,7 +58,15 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+class GmailRequest(BaseModel):
+    user_id: str
+    to_email: str
+    subject: str
+    body_text: str
+    thread_id: Optional[str] = None
+    reply_to_message_id: Optional[str] = None
 
+    
 @app.get("/auth/google/start")
 def start_auth_flow(request: Request):
     flow = Flow.from_client_config(
@@ -217,7 +227,9 @@ async def fetch_primary_inbox_emails_threaded(
             raw_date = h("Date")
             try:
                 parsed_date = parsedate_to_datetime(raw_date)
-                now = datetime.now(parsed_date.tzinfo)
+                ist = timezone(timedelta(hours=5, minutes=30))
+                parsed_date = parsed_date.astimezone(ist)
+                now = datetime.now(ist)
                 if parsed_date.date() == now.date():
                     sent_time = parsed_date.strftime("Today, %I:%M %p")
                 elif parsed_date.date() == (now - timedelta(days=1)).date():
@@ -268,18 +280,12 @@ async def fetch_primary_inbox_emails_threaded(
     }})
 
 @app.post("/emails/send")
-async def send_email(
-    user_id: str ,
-    to_email: str ,
-    subject: str ,
-    body_text: str,
-    thread_id: Optional[str] = None,
-    reply_to_message_id: Optional[str] = None
-):
-    if user_id not in TOKEN_STORE:
+async def send_email( request: GmailRequest):
+
+    if request.user_id not in TOKEN_STORE:
         raise HTTPException(status_code=404, detail="No tokens found for this user_id")
     
-    tok = TOKEN_STORE[user_id]
+    tok = TOKEN_STORE[request.user_id]
     creds = Credentials(
         token=tok.get("access_token"),
         refresh_token=tok.get("refresh_token"),
@@ -291,8 +297,8 @@ async def send_email(
 
     if not creds.valid:
         creds.refresh(GoogleAuthRequest())
-        TOKEN_STORE[user_id]["access_token"] = creds.token
-        TOKEN_STORE[user_id]["expiry"] = creds.expiry.isoformat() if creds.expiry else None
+        TOKEN_STORE[request.user_id]["access_token"] = creds.token
+        TOKEN_STORE[request.user_id]["expiry"] = creds.expiry.isoformat() if creds.expiry else None
 
     service = build("gmail", "v1", credentials=creds)
 
@@ -300,20 +306,20 @@ async def send_email(
     from email.mime.text import MIMEText
 
     message = MIMEMultipart("alternative")
-    message["to"] = to_email
+    message["to"] = request.to_email
     message["from"] = tok["user_email"]
-    message["subject"] = subject
+    message["subject"] = request.subject
 
-    if thread_id and reply_to_message_id:
-        message["In-Reply-To"] = reply_to_message_id
-        message["References"] = reply_to_message_id
+    if request.thread_id and request.reply_to_message_id:
+        message["In-Reply-To"] = request.reply_to_message_id
+        message["References"] = request.reply_to_message_id
 
-    message.attach(MIMEText(body_text, "plain"))
+    message.attach(MIMEText(request.body_text, "plain"))
     raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode()
     body = {"raw": raw_message}
 
-    if thread_id and thread_id.strip():
-        body["threadId"] = thread_id
+    if request.thread_id and request.thread_id.strip():
+        body["threadId"] = request.thread_id
 
     try:
         sent_msg = service.users().messages().send(userId="me", body=body).execute()
