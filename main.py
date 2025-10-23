@@ -123,6 +123,7 @@ async def auth_callback(code: str, state: str):
 
     return RedirectResponse(url=f"{FRONTEND_URL}/dashboard/{user_id}")
 
+#try to fetch the profile photos too
 @app.get("/emails/full-threaded/{user_id}")
 async def fetch_primary_inbox_emails_threaded(
     user_id: str,
@@ -266,4 +267,62 @@ async def fetch_primary_inbox_emails_threaded(
         "user_name": user_name
     }})
 
+@app.post("/emails/send")
+async def send_email(
+    user_id: str ,
+    to_email: str ,
+    subject: str ,
+    body_text: str,
+    thread_id: Optional[str] = None,
+    reply_to_message_id: Optional[str] = None
+):
+    if user_id not in TOKEN_STORE:
+        raise HTTPException(status_code=404, detail="No tokens found for this user_id")
+    
+    tok = TOKEN_STORE[user_id]
+    creds = Credentials(
+        token=tok.get("access_token"),
+        refresh_token=tok.get("refresh_token"),
+        token_uri=CLIENT_CONFIG["web"]["token_uri"],
+        client_id=CLIENT_CONFIG["web"]["client_id"],
+        client_secret=CLIENT_CONFIG["web"]["client_secret"],
+        scopes=SCOPES,
+    )
+
+    if not creds.valid:
+        creds.refresh(GoogleAuthRequest())
+        TOKEN_STORE[user_id]["access_token"] = creds.token
+        TOKEN_STORE[user_id]["expiry"] = creds.expiry.isoformat() if creds.expiry else None
+
+    service = build("gmail", "v1", credentials=creds)
+
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+
+    message = MIMEMultipart("alternative")
+    message["to"] = to_email
+    message["from"] = tok["user_email"]
+    message["subject"] = subject
+
+    if thread_id and reply_to_message_id:
+        message["In-Reply-To"] = reply_to_message_id
+        message["References"] = reply_to_message_id
+
+    message.attach(MIMEText(body_text, "plain"))
+    raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode()
+    body = {"raw": raw_message}
+
+    if thread_id and thread_id.strip():
+        body["threadId"] = thread_id
+
+    try:
+        sent_msg = service.users().messages().send(userId="me", body=body).execute()
+        return {
+            "status": "success",
+            "message_id": sent_msg.get("id"),
+            "thread_id": sent_msg.get("threadId")
+        }
+    except Exception as e:
+        logger.error(f"Failed to send email: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to send email: {e}")
 
