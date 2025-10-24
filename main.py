@@ -58,11 +58,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 class GmailRequest(BaseModel):
     user_id: str
-    to_email: str
-    subject: str
     body_text: str
+    to_email: Optional[str] = None
+    subject: Optional[str] = None
     thread_id: Optional[str] = None
     reply_to_message_id: Optional[str] = None
 
@@ -307,7 +308,7 @@ async def send_email( request: GmailRequest):
 
     message = MIMEMultipart("alternative")
     message["to"] = request.to_email
-    message["from"] = tok["user_email"]
+    message["to"] = request.to_email or tok["user_email"]
     message["subject"] = request.subject
 
     if request.thread_id and request.reply_to_message_id:
