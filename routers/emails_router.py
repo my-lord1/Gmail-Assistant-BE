@@ -29,7 +29,7 @@ class GmailRequest(BaseModel):
 @router.get("/full-threaded/{user_id}")
 async def fetch_primary_inbox_emails_threaded(
     user_id: str,
-    max_threads: int = 20,
+    max_threads: int = 10, #later change this 20
     max_messages_per_thread: int = 10,
     include_read: bool = True
 ):

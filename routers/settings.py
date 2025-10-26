@@ -8,6 +8,7 @@ CLIENT_SECRET = os.getenv("CLIENT_SECRET")
 REDIRECT_URI = os.getenv("REDIRECT_URI")
 FRONTEND_MAIL_PAGE = os.getenv("FRONTEND_MAIL_PAGE")
 FRONTEND_URL = os.getenv("FRONTEND_URL")
+BACKEND_URL = os.getenv("BACKEND_URL")
 
 CLIENT_CONFIG = {
     "web": {
