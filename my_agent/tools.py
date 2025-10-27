@@ -11,6 +11,8 @@ from routers.settings import CLIENT_CONFIG, SCOPES
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from googleapiclient.discovery import build
 from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Callable, Any, Optional
+from langchain_core.tools import BaseTool
 
 #helper funcitons
 def parse_email_html(html_content: str) -> str:
@@ -74,6 +76,7 @@ def fetch_emails(
     max_messages_per_thread: int = 10,
     include_read: bool = True
 ) -> Dict[str, Any]:
+    """fetch emails of the userid"""
     try:
         url = f"{BACKEND_URL}/emails/full-threaded/{user_id}"
         params = {
@@ -94,11 +97,11 @@ def fetch_emails(
             for message in thread.get("messages", []):
                 # Add clean body field
                 if message.get("body_html"):
-                    message["body_clean"] = parse_email_html(message["body_html"])
+                    message["body"] = parse_email_html(message["body_html"])
                 elif message.get("body_text"):
-                    message["body_clean"] = message["body_text"]
+                    message["body"] = message["body_text"]
                 else:
-                    message["body_clean"] = message.get("snippet", "")
+                    message["body"] = message.get("snippet", "")
                 
                 message.pop("body_html", None)
                 message.pop("body_text", None)
@@ -125,6 +128,7 @@ def send_email(
     thread_id: Optional[str] = None,
     reply_to_message_id: Optional[str] = None
 ) -> Dict[str, Any]:
+    """Send an email to a recipient"""
     try:
         url = f"{BACKEND_URL}/emails/send"
         payload = {
@@ -158,6 +162,7 @@ def check_calendar(
     user_id: str,
     dates: List[str]
 ) -> Dict[str, Any]:
+    """check the calendar for the these dates"""
     try:        
         creds = get_credentials(user_id)
         service = build("calendar", "v3", credentials=creds)
@@ -298,6 +303,7 @@ def schedule_meeting(
     timezone: str,
     description: Optional[str] = ""
 ) -> Dict[str, Any]:
+    """schedule meetings for that date"""
     try:
         creds = get_credentials(user_id)
         service = build("calendar", "v3", credentials=creds)
@@ -356,4 +362,20 @@ def schedule_meeting(
             "error": f"Failed to schedule meeting: {str(e)}"
         }
 
-email_tools = [fetch_emails, send_email, check_calendar, schedule_meeting]
+
+def get_tools(tool_names: Optional[List[str]]) -> List[BaseTool]:
+    all_tools ={"fetch_emails_tool": fetch_emails,
+                "send_email_tool": send_email,
+                "check_calendar_tool": check_calendar,
+                "schedule_meeting_tool": schedule_meeting}
+
+    if tool_names is None:
+        return list(all_tools.values())
+    
+    return [all_tools[name] for name in tool_names if name in all_tools]
+
+def get_tools_by_name(tools: Optional[List[BaseTool]] = None) -> Dict[str, BaseTool]:
+    if tools is None:
+        tools = get_tools() 
+    
+    return {tool.name: tool for tool in tools}
