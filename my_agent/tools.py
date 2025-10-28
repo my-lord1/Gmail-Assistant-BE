@@ -13,6 +13,7 @@ from googleapiclient.discovery import build
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Callable, Any, Optional
 from langchain_core.tools import BaseTool
+from pydantic import BaseModel
 
 #helper funcitons
 def parse_email_html(html_content: str) -> str:
@@ -362,12 +363,23 @@ def schedule_meeting(
             "error": f"Failed to schedule meeting: {str(e)}"
         }
 
+@tool
+class Done(BaseModel):
+    """E-mail has been sent."""
+    done: bool
+
+@tool
+class Question(BaseModel):
+      """Question to ask user."""
+      content: str
 
 def get_tools(tool_names: Optional[List[str]]) -> List[BaseTool]:
     all_tools ={"fetch_emails_tool": fetch_emails,
                 "send_email_tool": send_email,
                 "check_calendar_tool": check_calendar,
-                "schedule_meeting_tool": schedule_meeting}
+                "schedule_meeting_tool": schedule_meeting,
+                "Done": Done,
+                "Question": Question}
 
     if tool_names is None:
         return list(all_tools.values())
