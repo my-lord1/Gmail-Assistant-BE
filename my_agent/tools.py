@@ -90,10 +90,7 @@ def fetch_emails(
         response.raise_for_status()
         
         data = response.json()
-        
-        if "user_info" in data:
-            del data["user_info"]
-        
+            
         for thread in data.get("threads", []):
             for message in thread.get("messages", []):
                 # Add clean body field

@@ -5,7 +5,8 @@ from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
 from datetime import datetime
 from routers.settings import CLIENT_CONFIG, SCOPES, REDIRECT_URI, CLIENT_ID, FRONTEND_URL
-from routers.stores import STATE_STORE, TOKEN_STORE
+from routers.stores import save_state_key, get_state_key, delete_state_key, save_token
+
 
 router = APIRouter(prefix="/auth/google", tags=["Authentication"])
 
@@ -23,18 +24,15 @@ def start_auth_flow(request: Request):
         prompt='consent'
     )
 
-    STATE_STORE[state] = {
-        "created_at": datetime.now(),
-    }
-
+    save_state_key(state)
     return {"authorization_url": authorization_url}
 
 @router.get("/callback")
 async def auth_callback(code: str, state: str):
-    if state not in STATE_STORE:
-        raise HTTPException(status_code=400, detail="Invalid or expired state parameter (CSRF attempt)")
     
-    del STATE_STORE[state]
+    if not get_state_key(state):
+        raise HTTPException(status_code=400, detail="Invalid or expired state parameter")
+    delete_state_key(state)
     
     flow = Flow.from_client_config(
         CLIENT_CONFIG,
@@ -60,17 +58,13 @@ async def auth_callback(code: str, state: str):
         user_id = idinfo.get("sub")  # Google's unique user ID
         user_email = idinfo.get("email")
 
-    TOKEN_STORE[user_id] = {
-        "user_email": user_email,
-        "refresh_token": credentials.refresh_token,
-        "access_token": credentials.token,
-        "scopes": list(credentials.scopes),
-        "expiry": credentials.expiry.isoformat() if credentials.expiry else None,
-        "created_at": datetime.now().isoformat()
-    }
-    print("--- DEBUG: TOKEN_STORE WRITE CHECK (CALLBACK) ---")
-    print(f"User ID: {user_id}")
-    print(f"Stored Data: {TOKEN_STORE.get(user_id)}")
-    print("--------------------------------------------------")
-
+    save_token(
+        user_id=user_id,
+        user_email=user_email,
+        access_token=credentials.token,
+        refresh_token=credentials.refresh_token,
+        scopes=list(credentials.scopes),
+        expiry=credentials.expiry.isoformat() if credentials.expiry else None
+    )
+    
     return RedirectResponse(url=f"{FRONTEND_URL}/dashboard/{user_id}")

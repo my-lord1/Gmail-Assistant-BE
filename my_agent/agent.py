@@ -10,9 +10,10 @@ from my_agent.schema import RouterSchema, State, StateInput
 from my_agent.prompts import triage_system_prompt, default_background, triage_system_prompt, triage_user_prompt, default_triage_instructions, MEMORY_UPDATE_INSTRUCTIONS, default_cal_preferences, default_response_preferences, agent_system_prompt_hitl_memory, GMAIL_TOOLS_PROMPT, MEMORY_UPDATE_INSTRUCTIONS_REINFORCEMENT
 from my_agent.utils import parse_gmail
 from langgraph.store.memory import InMemoryStore
+from langsmith import traceable
 
 load_dotenv()
-
+store = InMemoryStore()
 tools = get_tools(["send_email_tool", "check_calendar_tool", "schedule_meeting_tool", "Question", "Done"])
 tools_by_name = get_tools_by_name(tools)
 
@@ -50,6 +51,7 @@ def update_memory(store, namespace, messages):
     store.put(namespace, "user_preferences", result.user_preferences) #try result.content
 
 #1st node - 
+@traceable
 def triage_router(state: State, store: BaseStore) -> Command[Literal["triage_interrupt_handler", "response_agent", "__end__"]]:
     """Analyze email content to decide if we should respond, notify, or ignore.
 
@@ -87,7 +89,7 @@ def triage_router(state: State, store: BaseStore) -> Command[Literal["triage_int
         update = {
             "classification_decision": result.classification,
             "messages": [{"role": "user",
-                            "content": f"Respond to the email:"
+                            "content": f"Respond to the email:{user_prompt}"
                         }],
         }
         #take care of this update 
@@ -103,10 +105,11 @@ def triage_router(state: State, store: BaseStore) -> Command[Literal["triage_int
         }
     else:
         raise ValueError(f"Invalid classification: {classification}")
-    
+    print(f"update1: {update}")
     return Command(goto=goto, update=update)
 
 #2nd node -
+@traceable
 def triage_interrupt_handler(state: State, store: BaseStore) -> Command[Literal["response_agent", "__end__"]]:
     """Handles interrupts from the triage step"""
     from_, to, subject, body_clean, id_ = parse_gmail(state["email_input"])
@@ -164,13 +167,17 @@ def triage_interrupt_handler(state: State, store: BaseStore) -> Command[Literal[
     update = {
         "messages": messages,
     }
-
+    print(f"update2: {update}")
     return Command(goto=goto, update=update)
 
 #subagent
 # response_agent - node1
+@traceable
 def llm_call(state: State, store: BaseStore):
     """LLM decides whether to call a tool or not"""
+    print("LAST MESSAGE:", state["messages"][-1])
+    print("TYPE:", type(state["messages"][-1]))
+
     cal_preferences = get_memory(store, ("email_assistant", "cal_preferences"), default_cal_preferences)
     response_preferences = get_memory(store, ("email_assistant", "response_preferences"), default_response_preferences)
 
@@ -190,8 +197,12 @@ def llm_call(state: State, store: BaseStore):
     }
 
 # response_agent - node3
+@traceable
 def interrupt_handler(state: State, store: BaseStore) -> Command[Literal["llm_call", "__end__"]]:
     """Creates an interrupt for human review of tool calls"""
+    print("LAST MESSAGE:", state["messages"][-1])
+    print("TYPE:", type(state["messages"][-1]))
+
     result = []
     goto = "llm_call"
 
@@ -246,7 +257,8 @@ def interrupt_handler(state: State, store: BaseStore) -> Command[Literal["llm_ca
         }
     
     response = interrupt([request])[0]
-    
+    print(type(result))
+    print(result)
     if response["type"] == "accept":
         tool = tools_by_name[tool_call["name"]]
         observation = tool.invoke(tool_call["args"])
@@ -336,10 +348,11 @@ def interrupt_handler(state: State, store: BaseStore) -> Command[Literal["llm_ca
     update = {
         "messages": result,
     }
-
+    print(f"update4: {update}")
     return Command(goto=goto, update=update)
 
 # response_agent - node2
+@traceable
 def should_continue(state: State, store: BaseStore) -> Literal["interupt_handler", "mark_as_read_node"]:
      """Route to tool handler or end if Done tool called"""
      messages = state["messages"]
@@ -352,6 +365,7 @@ def should_continue(state: State, store: BaseStore) -> Literal["interupt_handler
                      return "interrupt_handler"
 
 # response_agent - node4
+@traceable
 def mark_as_read_node(state: State):
     email_input = state["email_input"]
     from_, to, subject, body_clean, id_ = parse_gmail(email_input)
@@ -363,6 +377,7 @@ agent_builder.add_node("interrupt_handler", interrupt_handler)
 agent_builder.add_node("mark_as_read_node", mark_as_read_node)
 
 #subagent
+
 agent_builder.add_edge(START, "llm_call")
 agent_builder.add_conditional_edges(
      "llm_call",

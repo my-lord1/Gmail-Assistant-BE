@@ -12,7 +12,11 @@ import logging
 from typing import Optional
 from pydantic import BaseModel
 from routers.settings import CLIENT_CONFIG, SCOPES
-from routers.stores import TOKEN_STORE
+from routers.stores import save_token, get_token, update_access_token, delete_token
+from db.mongodb import email_threads
+import threading
+from bs4 import BeautifulSoup
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -26,17 +30,19 @@ class GmailRequest(BaseModel):
     thread_id: Optional[str] = None
     reply_to_message_id: Optional[str] = None
 
-@router.get("/full-threaded/{user_id}")
-async def fetch_primary_inbox_emails_threaded(
+token_lock = threading.Lock()
+
+def fetch_primary_inbox_emails_threaded_sync(
     user_id: str,
-    max_threads: int = 10, #later change this 20
+    max_threads: int = 20, #later change this 20
     max_messages_per_thread: int = 10,
     include_read: bool = True
 ):
-    if user_id not in TOKEN_STORE:
+    
+    tok = get_token(user_id)
+    if not tok:
         raise HTTPException(status_code=404, detail="No tokens found for this user_id")
 
-    tok = TOKEN_STORE[user_id]
     creds = Credentials(
         token=tok.get("access_token"),
         refresh_token=tok.get("refresh_token"),
@@ -48,8 +54,11 @@ async def fetch_primary_inbox_emails_threaded(
 
     if not creds.valid:
         creds.refresh(GoogleAuthRequest())
-        TOKEN_STORE[user_id]["access_token"] = creds.token
-        TOKEN_STORE[user_id]["expiry"] = creds.expiry.isoformat() if creds.expiry else None
+        update_access_token(
+            user_id,
+            creds.token,
+            creds.expiry.isoformat() if creds.expiry else None
+        )
 
     service = build("gmail", "v1", credentials=creds)
     profile_info = service.users().getProfile(userId="me").execute()
@@ -99,6 +108,28 @@ async def fetch_primary_inbox_emails_threaded(
                 body_html += decode_part(payload)
         return body_text, body_html
 
+    def parse_email_html(html_content: str) -> str:
+        if not html_content:
+            return ""
+        
+        soup = BeautifulSoup(html_content, 'html.parser')
+        
+        for element in soup(["script", "style", "head"]):
+            element.decompose()
+        
+        text = soup.get_text(separator='\n')
+        
+        lines = []
+        for line in text.splitlines():
+            cleaned = line.strip()
+            if cleaned and cleaned != '&nbsp;':
+                lines.append(cleaned)
+        
+        clean_text = '\n'.join(lines)
+        clean_text = re.sub(r'\n{3,}', '\n\n', clean_text)
+        
+        return clean_text.strip()
+
     for thread in threads:
         thread_id = thread.get("id")
         thread_data = service.users().threads().get(userId="me", id=thread_id, format="full").execute()
@@ -112,6 +143,10 @@ async def fetch_primary_inbox_emails_threaded(
                 return next((h["value"] for h in headers if h["name"].lower() == name.lower()), None)
 
             body_text, body_html = extract_mime_parts(payload)
+            
+            #make the room for boooooody_clean
+            body_clean = parse_email_html(body_html)
+
 
             label_ids = msg.get("labelIds", [])
             is_unread = "UNREAD" in label_ids
@@ -142,6 +177,7 @@ async def fetch_primary_inbox_emails_threaded(
                 "is_unread": is_unread,
                 "body_text": body_text.strip(),
                 "body_html": body_html.strip(),
+                "body_clean": body_clean
             }
             thread_msgs.append(msg_obj)
 
@@ -155,6 +191,7 @@ async def fetch_primary_inbox_emails_threaded(
         thread_msgs.sort(key=lambda m: parse_date_safe(m.get("date")))
 
         all_threads.append({
+            "userId": user_id,
             "threadId": thread_id,
             "message_count": len(thread_msgs),
             "subject": thread_msgs[0]["subject"] if thread_msgs else None,
@@ -162,22 +199,29 @@ async def fetch_primary_inbox_emails_threaded(
             "messages": thread_msgs
         })
 
-    return JSONResponse(content={
+    return {
         "thread_count": len(all_threads),
         "threads": all_threads,
         "user_info": {
+            "user_id": user_id,
             "gmail_id": gmail_id,
             "profile_photo": profile_photo,
             "user_name": user_name
         }
-    })
+    }
+
+@router.get("/full-threaded/{user_id}")
+async def fetch_primary_inbox_emails_threaded(user_id: str):
+    """API endpoint - wraps the sync function"""
+    return fetch_primary_inbox_emails_threaded_sync(user_id)
 
 @router.post("/send")
 async def send_email(request: GmailRequest):
-    if request.user_id not in TOKEN_STORE:
+
+    tok = get_token(request.user_id)
+    if not tok:
         raise HTTPException(status_code=404, detail="No tokens found for this user_id")
-    
-    tok = TOKEN_STORE[request.user_id]
+
     creds = Credentials(
         token=tok.get("access_token"),
         refresh_token=tok.get("refresh_token"),
@@ -189,8 +233,11 @@ async def send_email(request: GmailRequest):
 
     if not creds.valid:
         creds.refresh(GoogleAuthRequest())
-        TOKEN_STORE[request.user_id]["access_token"] = creds.token
-        TOKEN_STORE[request.user_id]["expiry"] = creds.expiry.isoformat() if creds.expiry else None
+        update_access_token(
+            request.user_id,
+            creds.token,
+            creds.expiry.isoformat() if creds.expiry else None
+        )
 
     service = build("gmail", "v1", credentials=creds)
 
@@ -219,3 +266,4 @@ async def send_email(request: GmailRequest):
     except Exception as e:
         logger.error(f"Failed to send email: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to send email: {e}")
+    

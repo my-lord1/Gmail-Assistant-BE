@@ -1,0 +1,11 @@
+{
+    "dependencies": [
+      "langchain_openai",
+      "./my_agent"
+    ],
+    "graphs": {
+      "my_agent": "./my_agent/agent.py:email_assistant"
+    },
+    "env": "./.env"
+  }
+  
