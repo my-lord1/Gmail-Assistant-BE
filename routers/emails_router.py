@@ -17,6 +17,8 @@ from db.mongodb import email_threads
 import threading
 from bs4 import BeautifulSoup
 import re
+from inngest.storage import get_user_threads_from_mongo
+from db.mongodb import user_profiles
 
 logger = logging.getLogger(__name__)
 
@@ -210,10 +212,49 @@ def fetch_primary_inbox_emails_threaded_sync(
         }
     }
 
+from fastapi import HTTPException
+
 @router.get("/full-threaded/{user_id}")
-async def fetch_primary_inbox_emails_threaded(user_id: str):
-    """API endpoint - wraps the sync function"""
-    return fetch_primary_inbox_emails_threaded_sync(user_id)
+async def get_full_threaded_emails(user_id: str):
+    try:
+        threads_docs = list(
+            email_threads.find({"user_id": user_id}).sort("updated_at", -1)
+        )
+
+        if not threads_docs:
+            return {
+                "thread_count": 0,
+                "threads": [],
+                "user_info": None
+            }
+
+        transformed_threads = [
+            {
+                "threadId": t.get("thread_id"),
+                "message_count": t.get("message_count", 0),
+                "subject": t.get("subject", ""),
+                "participants": t.get("participants", []),
+                "messages": t.get("messages", [])
+            }
+            for t in threads_docs
+        ]
+
+        user_profile = user_profiles.find_one({"user_id": user_id})
+        user_info = {
+            "gmail_id": user_profile.get("gmail_id"),
+            "profile_photo": user_profile.get("profile_photo"),
+            "user_name": user_profile.get("user_name")
+        } if user_profile else None
+
+        return {
+            "thread_count": len(transformed_threads),
+            "threads": transformed_threads,
+            "user_info": user_info
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @router.post("/send")
 async def send_email(request: GmailRequest):
