@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field, EmailStr
-from typing import List
+from typing import List, Dict, Any
 from datetime import datetime
 
 class GmailMessage(BaseModel):
@@ -33,3 +33,11 @@ class TokenSchema(BaseModel):
 class StateSchema(BaseModel):
     state_key: str = Field(..., description="Unique random string generated for OAuth state")
     created_at: datetime = Field(default_factory=datetime.utcnow, description="Timestamp when this state was created")
+
+
+class AgentMemory(BaseModel):
+    namespace: str = Field(..., description="User or agent namespace (e.g. user_id)")
+    key: str = Field(..., description="Unique key for this memory entry")
+    value: Dict[str, Any] = Field(default_factory=dict, description="Stored memory data")
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)

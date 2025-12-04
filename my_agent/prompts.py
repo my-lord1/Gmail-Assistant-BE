@@ -110,8 +110,12 @@ default_triage_instructions = """
 Emails that are not worth responding to:
 - Marketing newsletters and promotional emails
 - Spam or suspicious emails
-- CC'd on FYI threads with no direct questions
+- FYI threads with no direct questions
 - Bank emails that are purely informational, such as account balance updates or transaction alerts
+- Marketing newsletters and promotional emails
+- Blogs, research papers, tech articles, or content updates from companies
+- Automated updates from tools or platforms
+- Any mail that does not require a human reply
 
 There are also other things that should be known about, but don't require an email response. For these, you should notify (using the `notify` response). Examples of this include:
 - Team member out sick or on vacation
@@ -208,10 +212,98 @@ Remember:
 """
 
 GMAIL_TOOLS_PROMPT = """
-1. fetch_emails_tool(user_id, max_threads, max_messages_per_thread) - Fetch recent emails from Gmail
-2. send_email_tool(user_id, body_text, to_email(optional), subject(optional), thread_id(optional), reply_message_id)(optional) - Send a reply to an email thread
-3. check_calendar_tool(user_id ,dates) - Check Google Calendar availability for specific dates
-4. schedule_meeting_tool(user_id, attendees, title, start_time, end_time, timezone, description(optional)) - Schedule a meeting and send invites
-5. triage_email(ignore, notify, respond) - Triage emails into one of three categories
-6. Done - E-mail has been sent
+EMAIL CONTEXT:
+- email_input.user_id = {email_input.user_id}
+- email_input.thread_id = {email_input.thread_id}
+- email_input.id = {email_input.id}
+- email_input.from = {email_input.from}
+- email_input.to = {email_input.to}
+- email_input.subject = {email_input.subject}
+- email_input.body = {email_input.body}
+
+Available Tools:
+
+1. fetch_emails(user_id, max_threads, max_messages_per_thread, include_read)
+   - Retrieves all email threads for a user
+   - user_id MUST be: {email_input.user_id}
+
+2. send_email(
+       user_id,
+       body_text,
+       to_email (optional),
+       subject (optional),
+       thread_id (optional),
+       reply_to_message_id (optional)
+   )
+   - Sends or replies to emails
+   - user_id MUST be: {email_input.user_id}
+
+3. check_calendar(user_id, dates)
+   - Checks calendar availability for given dates
+   - user_id MUST be: {email_input.user_id}
+   - dates format: ["DD-MM-YYYY"]
+
+4. schedule_meeting(
+       user_id,
+       attendees,
+       title,
+       start_time,
+       end_time,
+       timezone,
+       description (optional)
+   )
+   - Schedules a meeting on calendar
+   - user_id MUST be: {email_input.user_id}
+   - start_time and end_time format: "YYYY-MM-DDTHH:MM:SS"
+
+5. Done - Returns when email task is complete
+
+CRITICAL USER_ID RULES:
+- ONLY valid user_id is: {email_input.user_id}
+- Never guess, invent, or change user_id
+- Never use email address as user_id
+- Never use message_id or thread_id as user_id
+- ALWAYS pass user_id = {email_input.user_id} in EVERY tool call
+
+REPLY MODE (Replying to current email):
+- Include: thread_id = {email_input.thread_id}
+- Include: reply_to_message_id = {email_input.id}
+- Include: to_email = {email_input.from}
+- OMIT: subject parameter
+- Example:
+  send_email(
+    user_id={email_input.user_id},
+    body_text="Your reply text",
+    to_email={email_input.from},
+    thread_id={email_input.thread_id},
+    reply_to_message_id={email_input.id}
+  )
+
+NEW EMAIL MODE (Sending new/unrelated email):
+- Include: to_email
+- Include: subject
+- Include: body_text
+- OMIT: thread_id and reply_to_message_id
+- Example:
+  send_email(
+    user_id={email_input.user_id},
+    body_text="Your message",
+    to_email="recipient@example.com",
+    subject="Email subject"
+  )
+
+DECISION LOGIC:
+- If replying to current email → REPLY MODE
+- If sending new message → NEW EMAIL MODE
+- If checking availability → check_calendar with dates in "DD-MM-YYYY" format
+- If scheduling meeting → schedule_meeting with ISO 8601 datetime format
+
+IMPORTANT RULES:
+- user_id parameter is ALWAYS {email_input.user_id}
+- Never change or question this value
+- For replies: include thread_id, reply_to_message_id, exclude subject
+- For new emails: include subject, exclude thread_id and reply_to_message_id
+- Date format for calendar: "DD-MM-YYYY"
+- Time format for scheduling: "YYYY-MM-DDTHH:MM:SS"
+- Do not skip the mail, every should mail should complete the workflow.
 """

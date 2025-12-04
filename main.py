@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from routers import auth_router, emails_router
+from routers import auth_router, emails_router, agent_router
 from routers.settings import FRONTEND_URL
 from inngest.cron import start_scheduler, stop_scheduler
 from inngest.storage import verify_mongodb_connection
@@ -38,6 +38,7 @@ app.add_middleware(
 
 app.include_router(auth_router.router)
 app.include_router(emails_router.router)
+app.include_router(agent_router.router)
 
 @app.get("/")
 def read_root():

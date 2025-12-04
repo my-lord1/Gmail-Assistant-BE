@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing_extensions import TypedDict, Literal
+from typing_extensions import TypedDict, Literal, Optional
 from langgraph.graph import MessagesState
 
 class RouterSchema(BaseModel):
@@ -15,13 +15,13 @@ class RouterSchema(BaseModel):
     )
 
 class StateInput(TypedDict):
-    # This is the input to the state
     email_input: dict
+    user_response: Optional[dict]  
 
 class State(MessagesState):
-    # This state class has the messages key build in
     email_input: dict
     classification_decision: Literal["ignore", "respond", "notify"]
+    user_response: Optional[dict]  
 
 class UserPreferences(BaseModel):
     """Updated user preferences based on user's feedback."""

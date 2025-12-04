@@ -33,7 +33,12 @@ def save_token(user_id: str, user_email: str, access_token: str, refresh_token: 
     )
 
 def get_token(user_id: str):
-    return token_store.find_one({"user_id": user_id})
+    return token_store.find_one({
+        "$or": [
+            {"user_id": user_id},
+            {"user_email": user_id}
+        ]
+    })
 
 def get_all_tokens():
     try:

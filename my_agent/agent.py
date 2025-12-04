@@ -9,12 +9,19 @@ from my_agent.tools import get_tools, get_tools_by_name, mark_email_as_read
 from my_agent.schema import RouterSchema, State, StateInput
 from my_agent.prompts import triage_system_prompt, default_background, triage_system_prompt, triage_user_prompt, default_triage_instructions, MEMORY_UPDATE_INSTRUCTIONS, default_cal_preferences, default_response_preferences, agent_system_prompt_hitl_memory, GMAIL_TOOLS_PROMPT, MEMORY_UPDATE_INSTRUCTIONS_REINFORCEMENT
 from my_agent.utils import parse_gmail
-from langgraph.store.memory import InMemoryStore
 from langsmith import traceable
+from db.mongodb import db
+from db.mongodb_store import MongoDBStore
+from db.mongodb import mongo_saver
 
 load_dotenv()
-store = InMemoryStore()
-tools = get_tools(["send_email_tool", "check_calendar_tool", "schedule_meeting_tool", "Question", "Done"])
+checkpointer = mongo_saver
+memory_store = MongoDBStore(db)
+
+
+tools = get_tools(["send_email", "check_calendar", "schedule_meeting", "Question", "Done"])
+
+
 tools_by_name = get_tools_by_name(tools)
 
 llm = ChatGoogleGenerativeAI(model = "gemini-2.5-pro", api_key = os.getenv("GOOGLE_API_KEY"), temperature = 0)
@@ -27,91 +34,89 @@ llm_with_tools = llm.bind_tools(tools, tool_choice = "auto")
 #print(result.content) 
 
 def get_memory(store, namespace, default_content=None):
-    """Get memory from the store or initialize with default if it doesn't exist."""
+    """Fetch or safely initialize memory without causing duplicate inserts."""
+    
     user_preferences = store.get(namespace, "user_preferences")
     if user_preferences:
-        return user_preferences.value
-    else:
+        return user_preferences
+
+    try:
         store.put(namespace, "user_preferences", default_content)
-        user_preferences = default_content
-    
-    return user_preferences
+        return default_content
+    except:
+        existing = store.get(namespace, "user_preferences")
+        return existing if existing else default_content
 
 def update_memory(store, namespace, messages):
     """Update memory profile in the store."""
+    
     user_preferences = store.get(namespace, "user_preferences")
-    current_profile = user_preferences.value if user_preferences else ""
+    if user_preferences is None:
+        current_profile = ""
+    elif hasattr(user_preferences, 'value'):
+        current_profile = user_preferences.value
+    else:
+        current_profile = str(user_preferences)
+    
     result = llm.invoke(
         [
             {"role": "system", 
-             "content": MEMORY_UPDATE_INSTRUCTIONS.format(current_profile = current_profile, namespace = namespace)}
+             "content": MEMORY_UPDATE_INSTRUCTIONS.format(current_profile=current_profile, namespace=namespace)}
         ] + messages
     )
 
-    store.put(namespace, "user_preferences", result.user_preferences) #try result.content
+    store.put(namespace, "user_preferences", result.content if hasattr(result, 'content') else str(result))
 
-#1st node - 
+#1st node 
 @traceable
-def triage_router(state: State, store: BaseStore) -> Command[Literal["triage_interrupt_handler", "response_agent", "__end__"]]:
-    """Analyze email content to decide if we should respond, notify, or ignore.
+def triage_router(state: State, store: BaseStore) -> Command[Literal["triage_interrupt_handler", "response_agent", "__end__", "mark_as_read_node"]]:
+    """Analyze email content to decide if we should respond, notify, or ignore."""
 
-    The triage step prevents the assistant from wasting time on:
-    - Marketing emails and spam
-    - Company-wide announcements
-    - Messages meant for other teams
-    """
     from_, to, subject, body_clean, id_ = parse_gmail(state["email_input"])
+
     user_prompt = triage_user_prompt.format(
-        author=from_,
-        to=to,
-        subject=subject,
-        body=body_clean,
-        id=id_,
+        author=from_, to=to, subject=subject, body=body_clean, id=id_,
     )
 
-    triage_instructions = get_memory(store, ("email_assistant", "triage_preferences"), default_triage_instructions)
-    print(triage_instructions)
+    triage_instructions = get_memory(memory_store, ("email_assistant", "triage_preferences"), default_triage_instructions)
+
     system_prompt = triage_system_prompt.format(
-        background= default_background,
-        triage_instructions= default_triage_instructions,
+        background=default_background,
+        triage_instructions=triage_instructions,
     )
 
-    result = llm_router.invoke(
-        [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ]
-    )
+    result = llm_router.invoke([
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ])
 
-    classification = result.classification
+    classification = getattr(result, "classification", None)
+
     if classification == "respond":
         goto = "response_agent"
         update = {
-            "classification_decision": result.classification,
-            "messages": [{"role": "user",
-                            "content": f"Respond to the email:{user_prompt}"
-                        }],
-        }
-        #take care of this update 
-    elif classification == "ignore":
-        goto = END
-        update = {
             "classification_decision": classification,
+            "messages": state.get("messages", []) + [
+                {"role": "user", "content": f"Respond to the email: {user_prompt}"}
+            ],
+            "email_input": state.get("email_input"),
         }
+    elif classification == "ignore":
+        goto = "mark_as_read_node"
+        update = {"classification_decision": classification, "email_input": state.get("email_input")}
     elif classification == "notify":
         goto = "triage_interrupt_handler"
-        update = {
-            "classification_decision": classification,
-        }
-    else:
-        raise ValueError(f"Invalid classification: {classification}")
-    print(f"update1: {update}")
-    return Command(goto=goto, update=update)
+        update = {"classification_decision": classification, "email_input": state.get("email_input")}
+        
+    cmd = Command(goto=goto, update=update)
+    return cmd
+
 
 #2nd node -
 @traceable
 def triage_interrupt_handler(state: State, store: BaseStore) -> Command[Literal["response_agent", "__end__"]]:
     """Handles interrupts from the triage step"""
+
     from_, to, subject, body_clean, id_ = parse_gmail(state["email_input"])
     email_markdown = {
         "author":from_,
@@ -136,11 +141,13 @@ def triage_interrupt_handler(state: State, store: BaseStore) -> Command[Literal[
             "allow_edit": False, 
             "allow_accept": False,  
         },
-        # Email to show in frontend or you can pass it in args for fronenf
-        "description": email_markdown,
+        "description": {
+            "question": "What should we do with this email?",
+            "options": ["response", "ignore"]
+  }
     }
     
-    response = interrupt([request])[0]
+    response = interrupt([request])
     if response["type"] == "response":
         user_input = response["args"]
         messages.append({"role": "user",
@@ -160,14 +167,11 @@ def triage_interrupt_handler(state: State, store: BaseStore) -> Command[Literal[
         
         update_memory(store, ("email_assistant", "triage_preferences"), messages)
         goto = END
-
-    else:
-        raise ValueError(f"Invalid response: {response}")
     
     update = {
         "messages": messages,
     }
-    print(f"update2: {update}")
+
     return Command(goto=goto, update=update)
 
 #subagent
@@ -175,9 +179,7 @@ def triage_interrupt_handler(state: State, store: BaseStore) -> Command[Literal[
 @traceable
 def llm_call(state: State, store: BaseStore):
     """LLM decides whether to call a tool or not"""
-    print("LAST MESSAGE:", state["messages"][-1])
-    print("TYPE:", type(state["messages"][-1]))
-
+ 
     cal_preferences = get_memory(store, ("email_assistant", "cal_preferences"), default_cal_preferences)
     response_preferences = get_memory(store, ("email_assistant", "response_preferences"), default_response_preferences)
 
@@ -199,205 +201,201 @@ def llm_call(state: State, store: BaseStore):
 # response_agent - node3
 @traceable
 def interrupt_handler(state: State, store: BaseStore) -> Command[Literal["llm_call", "__end__"]]:
-    """Creates an interrupt for human review of tool calls"""
-    print("LAST MESSAGE:", state["messages"][-1])
-    print("TYPE:", type(state["messages"][-1]))
+    """Creates an interrupt for human review of tool calls """
 
     result = []
     goto = "llm_call"
+    hitl_tools = ["send_email", "schedule_meeting", "Question"]
 
     for tool_call in state["messages"][-1].tool_calls:
-        hitl_tools = ["send_email_tool", "schedule_meeting_tool", "Question"]
         if tool_call["name"] not in hitl_tools:
             tool = tools_by_name[tool_call["name"]]
             observation = tool.invoke(tool_call["args"])
             result.append({"role": "tool", "content": observation, "tool_call_id": tool_call["id"]})
-            continue
-
+    
+    hitl_tool_call = next((tc for tc in state["messages"][-1].tool_calls if tc["name"] in hitl_tools), None)
+    
+    if not hitl_tool_call:
+        return Command(goto="llm_call", update={"messages": state["messages"] + result})
+    
+    tool_call = hitl_tool_call
     email_input = state["email_input"]
     from_, to, subject, body_clean, id_ = parse_gmail(email_input)
+    
     description = {
-        "author":from_,
-        "to":to,
-        "subject":subject,
-        "body":body_clean,
-        "id":id_,
+        "author": from_,
+        "to": to,
+        "subject": subject,
+        "body": body_clean,
+        "id": id_,
     }
-    if tool_call["name"] == "send_email_tool":
-            config = {
-                "allow_ignore": True,
-                "allow_respond": True,
-                "allow_edit": True,
-                "allow_accept": True,
-            }
-    elif tool_call["name"] == "schedule_meeting_tool":
-            config = {
-                "allow_ignore": True,
-                "allow_respond": True,
-                "allow_edit": True,
-                "allow_accept": True,
-            }
-    elif tool_call["name"] == "Question":
-            config = {
-                "allow_ignore": True,
-                "allow_respond": True,
-                "allow_edit": False,
-                "allow_accept": False,
-            }
-    else:
-        raise ValueError(f"Invalid tool call: {tool_call['name']}")
+    
+    config = {
+        "allow_ignore": True,
+        "allow_respond": True,
+        "allow_edit": True,
+        "allow_accept": True,
+    }
 
     request = {
-            "action_request": {
-                "action": tool_call["name"],
-                "args": tool_call["args"]
-            },
-            "config": config,
-            "description": description,
-        }
-    
-    response = interrupt([request])[0]
-    print(type(result))
-    print(result)
-    if response["type"] == "accept":
+        "action_request": {
+            "action": tool_call["name"],
+            "args": tool_call["args"]
+        },
+        "config": config,
+        "description": description,
+    }
+
+    response = interrupt(request) 
+
+    if response.get("type") == "accept":
         tool = tools_by_name[tool_call["name"]]
         observation = tool.invoke(tool_call["args"])
         result.append({"role": "tool", "content": observation, "tool_call_id": tool_call["id"]})
     
-    elif response["type"] == "edit":
+    elif response.get("type") == "edit":
         tool = tools_by_name[tool_call["name"]]
-        initial_tool_call = tool_call["args"]
-        edited_args = response["args"]["args"]
+        edited_args = response.get("args", tool_call["args"])
 
         ai_message = state["messages"][-1]
         current_id = tool_call["id"]
-        updated_tool_calls = [tc for tc in ai_message.tool_calls if tc["id"] != current_id] + [
-                {"type": "tool_call", "name": tool_call["name"], "args": edited_args, "id": current_id}
-            ]
+        updated_tool_calls = [
+            tc for tc in ai_message.tool_calls if tc["id"] != current_id
+        ] + [
+            {"type": "tool_call", "name": tool_call["name"], "args": edited_args, "id": current_id}
+        ]
         result.append(ai_message.model_copy(update={"tool_calls": updated_tool_calls}))
-        if tool_call["name"] == "send_email_tool":
-            observation = tool.invoke(edited_args)
-            result.append({"role": "tool", "content": observation, "tool_call_id": current_id})
-            update_memory(store, ("email_assistant", "response_preferences"), [{
-                    "role": "user",
-                    "content": f"User edited the email response. Here is the initial email generated by the assistant: {initial_tool_call}. Here is the edited email: {edited_args}. Follow all instructions above, and remember: {MEMORY_UPDATE_INSTRUCTIONS_REINFORCEMENT}."
-                }])
         
-        elif tool_call["name"] == "schedule_meeting_tool":
-                observation = tool.invoke(edited_args)
-                result.append({"role": "tool", "content": observation, "tool_call_id": current_id})
-                update_memory(store, ("email_assistant", "cal_preferences"), [{
-                    "role": "user",
-                    "content": f"User edited the calendar invitation. Here is the initial calendar invitation generated by the assistant: {initial_tool_call}. Here is the edited calendar invitation: {edited_args}. Follow all instructions above, and remember: {MEMORY_UPDATE_INSTRUCTIONS_REINFORCEMENT}."
-                }])
-
-        else:
-            raise ValueError(f"Invalid tool call: {tool_call['name']}")
+        observation = tool.invoke(edited_args)
+        result.append({"role": "tool", "content": observation, "tool_call_id": current_id})
+        
+        if tool_call["name"] == "send_email":
+            update_memory(store, ("email_assistant", "response_preferences"), [{
+                "role": "user",
+                "content": f"User edited the email with args: {edited_args}. {MEMORY_UPDATE_INSTRUCTIONS_REINFORCEMENT}."
+            }])
+        elif tool_call["name"] == "schedule_meeting":
+            update_memory(store, ("email_assistant", "cal_preferences"), [{
+                "role": "user",
+                "content": f"User edited the meeting with args: {edited_args}. {MEMORY_UPDATE_INSTRUCTIONS_REINFORCEMENT}."
+            }])
     
-    elif response["type"] == "ignore":
-
-            if tool_call["name"] == "send_email_tool":
-                result.append({"role": "tool", "content": "User ignored this email draft. Ignore this email and end the workflow.", "tool_call_id": tool_call["id"]})
-                goto = END
-                update_memory(store, ("email_assistant", "triage_preferences"), state["messages"] + result + [{
-                    "role": "user",
-                    "content": f"The user ignored the email draft. That means they did not want to respond to the email. Update the triage preferences to ensure emails of this type are not classified as respond. Follow all instructions above, and remember: {MEMORY_UPDATE_INSTRUCTIONS_REINFORCEMENT}."
-                }])
-
-            elif tool_call["name"] == "schedule_meeting_tool":
-                result.append({"role": "tool", "content": "User ignored this calendar meeting draft. Ignore this email and end the workflow.", "tool_call_id": tool_call["id"]})
-                goto = END
-                update_memory(store, ("email_assistant", "triage_preferences"), state["messages"] + result + [{
-                    "role": "user",
-                    "content": f"The user ignored the calendar meeting draft. That means they did not want to schedule a meeting for this email. Update the triage preferences to ensure emails of this type are not classified as respond. Follow all instructions above, and remember: {MEMORY_UPDATE_INSTRUCTIONS_REINFORCEMENT}."
-                }])
-
-            elif tool_call["name"] == "Question":
-                result.append({"role": "tool", "content": "User ignored this question. Ignore this email and end the workflow.", "tool_call_id": tool_call["id"]})
-                goto = END
-                update_memory(store, ("email_assistant", "triage_preferences"), state["messages"] + result + [{
-                    "role": "user",
-                    "content": f"The user ignored the Question. That means they did not want to answer the question or deal with this email. Update the triage preferences to ensure emails of this type are not classified as respond. Follow all instructions above, and remember: {MEMORY_UPDATE_INSTRUCTIONS_REINFORCEMENT}."
-                }])
-
-            else:
-                raise ValueError(f"Invalid tool call: {tool_call['name']}")
-            
-    elif response["type"] == "response":
-            user_feedback = response["args"]
-            if tool_call["name"] == "send_email_tool":
-                result.append({"role": "tool", "content": f"User gave feedback, which can we incorporate into the email. Feedback: {user_feedback}", "tool_call_id": tool_call["id"]})
-                update_memory(store, ("email_assistant", "response_preferences"), state["messages"] + result + [{
-                    "role": "user",
-                    "content": f"User gave feedback, which we can use to update the response preferences. Follow all instructions above, and remember: {MEMORY_UPDATE_INSTRUCTIONS_REINFORCEMENT}."
-                }])
-
-            elif tool_call["name"] == "schedule_meeting_tool":
-                result.append({"role": "tool", "content": f"User gave feedback, which can we incorporate into the meeting request. Feedback: {user_feedback}", "tool_call_id": tool_call["id"]})
-                update_memory(store, ("email_assistant", "cal_preferences"), state["messages"] + result + [{
-                    "role": "user",
-                    "content": f"User gave feedback, which we can use to update the calendar preferences. Follow all instructions above, and remember: {MEMORY_UPDATE_INSTRUCTIONS_REINFORCEMENT}."
-                }])
-
-            elif tool_call["name"] == "Question":
-                result.append({"role": "tool", "content": f"User answered the question, which can we can use for any follow up actions. Feedback: {user_feedback}", "tool_call_id": tool_call["id"]})
-
-            else:
-                raise ValueError(f"Invalid tool call: {tool_call['name']}")
-
-    update = {
-        "messages": result,
-    }
-    print(f"update4: {update}")
-    return Command(goto=goto, update=update)
+    elif response.get("type") == "ignore":
+        result.append({"role": "tool", "content": "User ignored this action.", "tool_call_id": tool_call["id"]})
+        goto = "__end__"
+        update_memory(store, ("email_assistant", "triage_preferences"), [{
+            "role": "user",
+            "content": f"User ignored an action. Update preferences. {MEMORY_UPDATE_INSTRUCTIONS_REINFORCEMENT}."
+        }])
+    
+    elif response.get("type") == "response":
+        user_feedback = response.get("args", "")
+        result.append({"role": "tool", "content": f"User feedback: {user_feedback}", "tool_call_id": tool_call["id"]})
+        
+        if tool_call["name"] == "send_email":
+            update_memory(store, ("email_assistant", "response_preferences"), [{
+                "role": "user",
+                "content": f"User provided feedback: {user_feedback}. {MEMORY_UPDATE_INSTRUCTIONS_REINFORCEMENT}."
+            }])
+        elif tool_call["name"] == "schedule_meeting":
+            update_memory(store, ("email_assistant", "cal_preferences"), [{
+                "role": "user",
+                "content": f"User provided feedback: {user_feedback}. {MEMORY_UPDATE_INSTRUCTIONS_REINFORCEMENT}."
+            }])
+    
+    return Command(goto=goto, update={"messages": state["messages"] + result})
 
 # response_agent - node2
 @traceable
-def should_continue(state: State, store: BaseStore) -> Literal["interupt_handler", "mark_as_read_node"]:
-     """Route to tool handler or end if Done tool called"""
-     messages = state["messages"]
-     last_message = messages[-1]
-     if last_message.tool_calls:
-          for tool_call in last_message.tool_calls:
-                if tool_call["name"] == "Done":
-                    return "mark_as_read_node"
-                else:
-                     return "interrupt_handler"
+def should_continue(state: State, store: BaseStore):
+    """Inside the sub-agent:
+       - If LLM calls Done → END sub-agent.
+       - Otherwise → interrupt_handler."""
+    
+    messages = state["messages"]
+    last_message = messages[-1]
+
+    tool_calls = last_message.tool_calls or []
+
+    for tool_call in tool_calls:
+        if tool_call.get("name") == "Done":
+            return END  
+
+    return "interrupt_handler"
+
 
 # response_agent - node4
 @traceable
 def mark_as_read_node(state: State):
+    """
+    This runs AFTER the entire response_agent workflow completes.
+    """
     email_input = state["email_input"]
-    from_, to, subject, body_clean, id_ = parse_gmail(email_input)
-    mark_email_as_read(id_)
+    message_id = email_input["id"]
+    user_id  = email_input["user_id"]
 
+    coll = db["email_threads"]
+
+    coll.update_one(
+        {"user_id": user_id, "messages.id": message_id},
+        {"$set": {"messages.$.is_unread": False}}
+    )
+
+    return Command(goto=END, update={})
+
+
+#subagent
 agent_builder = StateGraph(State)
 agent_builder.add_node("llm_call", llm_call)
 agent_builder.add_node("interrupt_handler", interrupt_handler)
-agent_builder.add_node("mark_as_read_node", mark_as_read_node)
-
-#subagent
-
 agent_builder.add_edge(START, "llm_call")
+
 agent_builder.add_conditional_edges(
-     "llm_call",
-     should_continue,
-     {
-          "interrupt_handler": "interrupt_handler",
-          "mark_as_read_node": "mark_as_read_node"
-     },
+    "llm_call",
+    should_continue,
+    {
+        "interrupt_handler": "interrupt_handler",
+        END: END,  
+    },
 )
-agent_builder.add_edge("mark_as_read_node", END)
+
+agent_builder.add_edge("interrupt_handler", "llm_call")
 response_agent = agent_builder.compile()
 
+
+#agent
 overall_workflow = (
     StateGraph(State, inout_schema=StateInput)
-    .add_node(triage_router)
-    .add_node(triage_interrupt_handler)
-    .add_node("response_agent", response_agent)
-    .add_node("mark_as_read_node", mark_as_read_node)
+
+    .add_node("triage_router", triage_router)
+    .add_node("triage_interrupt_handler", triage_interrupt_handler)
+    .add_node("response_agent", response_agent)   # sub-agent
+    .add_node("mark_as_read_node", mark_as_read_node)  # outer mark-as-read node
+
     .add_edge(START, "triage_router")
+    .add_conditional_edges(
+        "triage_router",
+        lambda state: state.get("classification_decision"),
+        {
+            "respond": "response_agent",
+            "notify": "triage_interrupt_handler",
+            "ignore": "mark_as_read_node",
+        }
+    )
+    .add_conditional_edges(
+        "triage_interrupt_handler",
+        lambda state: "response_agent" if state.get("classification_decision") == "response" else END,
+        {
+            "response_agent": "response_agent",
+            END: END,
+        }
+    )
+
+    .add_edge("response_agent", "mark_as_read_node")
     .add_edge("mark_as_read_node", END)
 )
 
-email_assistant = overall_workflow.compile()
+email_assistant = overall_workflow.compile(
+    checkpointer=mongo_saver,
+    store=memory_store
+)
