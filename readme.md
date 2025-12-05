@@ -10,19 +10,19 @@ check the below ss to know how the feedback loop and memory in the agent is stru
 ## Tech Stack
 
 - **FastAPI**
-- **Gmail API + OAuth 2.0**
+- **Gmail API + OAuth 2.0 + Google Calendar API**
 - **Langgraph agents (for classification & reply)**
 - **Python**
 
 ---
 ## Features
-✔ Google OAuth Login  
-✔ Fetch Gmail Inbox  
-✔ Email Classification (Ignore / Respond / Notify)  
-✔ Smart Auto Reply (AI drafts & sends emails)    
-✔ Persisted Agent State   
-✔ Compose & Send Email API  
-✔ Intergrated Gmail API, Google calendar API
+- **Google OAuth Login**
+- **Fetch Gmail Inbox**  
+- **Email Classification (Ignore / Respond / Notify)**  
+- **Smart Auto Reply (AI drafts & sends emails)**
+- **Persisted Agent State**
+- **Compose & Send Email API**
+- **Intergrated Gmail API, Google calendar API**
 ---
 ### Feedback loop
 ![HITL](./screenshots/feedback.png)
